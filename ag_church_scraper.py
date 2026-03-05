@@ -1,358 +1,356 @@
 """
-Scraper del Directorio de Iglesias de Assemblies of God (ag.org)
-================================================================
-Descarga información de iglesias del directorio en:
-https://ag.org/Resources/Directories/Church-Directory
+AG.org Church Directory Scraper
+================================
+Scrapes church listings from:
+  https://ag.org/Resources/Directories/Church-Directory?D=25
 
-Requisitos:
-    pip install selenium webdriver-manager requests beautifulsoup4 pandas
+Output CSV columns:
+  church_name, pastor, address, state, zip_code, phone
 
-Uso:
-    python ag_church_scraper.py
-    python ag_church_scraper.py --state TX          # Filtrar por estado
-    python ag_church_scraper.py --zip 65802         # Filtrar por código postal
-    python ag_church_scraper.py --headless False    # Ver el navegador en acción
+Usage:
+    uv run python ag_church_scraper.py
+    uv run python ag_church_scraper.py --url "https://ag.org/Resources/Directories/Church-Directory?D=25"
+    uv run python ag_church_scraper.py --headless false --output output/churches.csv
+    uv run python ag_church_scraper.py --dump-html   # saves page.html for selector debugging
 """
 
-import time
-import json
-import csv
+from __future__ import annotations
+
 import argparse
+import csv
 import logging
+import re
+import sys
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
-from typing import Optional
 
-import pandas as pd
+import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
-
-# Selenium imports
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.support.ui import WebDriverWait
 
-# ─── Configuración ────────────────────────────────────────────────────────────
-
-BASE_URL = "https://ag.org/Resources/Directories/Church-Directory"
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler(),
+        logging.StreamHandler(sys.stdout),
         logging.FileHandler("ag_scraper.log", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
 
-# ─── Modelo de datos ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_URL = "https://ag.org/Resources/Directories/Church-Directory?D=25"
+DEFAULT_OUTPUT = "ag_churches.csv"
+PAGE_LOAD_WAIT = 3      # seconds after initial navigation
+RESULTS_TIMEOUT = 30    # selenium explicit-wait timeout (seconds)
+
+# The page is server-side rendered — results are in div.panel > div.church-info
+CARD_SELECTOR = "div.church-info"
+
+# Regex to extract state + zip from the end of an address string
+# e.g. "6305 Orchard Ln Cincinnati, OH 45213"  →  state="OH", zip="45213"
+_STATE_ZIP_RE = re.compile(r",?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$")
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+CSV_FIELDS = ("church_name", "pastor", "address", "state", "zip_code", "phone")
+
 
 @dataclass
 class Church:
-    name: str = ""
+    church_name: str = ""
+    pastor: str = ""
     address: str = ""
-    city: str = ""
     state: str = ""
     zip_code: str = ""
     phone: str = ""
-    email: str = ""
-    website: str = ""
-    pastor: str = ""
-    service_times: str = ""
-    denomination: str = "Assemblies of God"
-    extra: dict = field(default_factory=dict)
 
-# ─── Driver ───────────────────────────────────────────────────────────────────
+    def is_valid(self) -> bool:
+        return bool(self.church_name)
 
-def build_driver(headless: bool = True) -> webdriver.Chrome:
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
+
+# ---------------------------------------------------------------------------
+# Browser
+# ---------------------------------------------------------------------------
+
+def build_driver(headless: bool = True) -> uc.Chrome:
+    options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
-    return driver
-
-# ─── Parsers de resultados ────────────────────────────────────────────────────
-
-def parse_church_card(card_html: str) -> Optional[Church]:
-    """Parsea un bloque HTML de una iglesia individual."""
-    soup = BeautifulSoup(card_html, "html.parser")
-    church = Church()
-
-    # Nombre (ajustar selectores según el HTML real del sitio)
-    name_el = soup.select_one(".church-name, h2, h3, .result-title, [class*='name']")
-    if name_el:
-        church.name = name_el.get_text(strip=True)
-
-    # Dirección
-    addr_el = soup.select_one(".address, [class*='address'], address")
-    if addr_el:
-        church.address = addr_el.get_text(" ", strip=True)
-
-    # Teléfono
-    phone_el = soup.select_one("[href^='tel:'], .phone, [class*='phone']")
-    if phone_el:
-        church.phone = phone_el.get_text(strip=True).replace("tel:", "")
-
-    # Email
-    email_el = soup.select_one("[href^='mailto:']")
-    if email_el:
-        church.email = email_el.get("href", "").replace("mailto:", "")
-
-    # Sitio web
-    web_el = soup.select_one("a[href^='http']:not([href*='ag.org'])")
-    if web_el:
-        church.website = web_el.get("href", "")
-
-    # Pastor
-    pastor_el = soup.select_one(".pastor, [class*='pastor'], [class*='minister']")
-    if pastor_el:
-        church.pastor = pastor_el.get_text(strip=True)
-
-    return church if church.name else None
+    # undetected-chromedriver handles anti-bot patching automatically;
+    # headless mode still works but is more detectable — use False for debugging
+    return uc.Chrome(options=options, headless=headless, use_subprocess=False, version_main=145)
 
 
-def parse_results_page(driver: webdriver.Chrome) -> list[Church]:
-    """Extrae todas las iglesias visibles en la página actual."""
-    html = driver.page_source
-    soup = BeautifulSoup(html, "html.parser")
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
 
-    churches = []
+def _text(el) -> str:
+    """Stripped inner text of a BS4 element, or empty string."""
+    return el.get_text(strip=True) if el else ""
 
-    # Selectores comunes — ajustar si el sitio usa otros
-    cards = soup.select(
-        ".church-result, .directory-result, .search-result, "
-        "[class*='church-card'], [class*='result-item'], "
-        "li.result, article.church"
-    )
 
-    if not cards:
-        # Fallback: busca cualquier bloque con nombre de iglesia
-        log.warning("No se encontraron tarjetas con selectores estándar. Intentando fallback...")
-        cards = soup.select("li, article, .item")
+def parse_address(raw: str) -> tuple[str, str, str]:
+    """
+    Split raw address text into (full_address, state, zip_code).
 
-    for card in cards:
-        church = parse_church_card(str(card))
+    '6305 Orchard Ln Cincinnati, OH 45213' → ('...', 'OH', '45213')
+    """
+    raw = raw.strip()
+    m = _STATE_ZIP_RE.search(raw)
+    if m:
+        return raw, m.group(1), m.group(2)
+    return raw, "", ""
+
+
+def parse_card(info_div) -> Church | None:
+    """
+    Parse one <div class="church-info"> element.
+
+    HTML structure (from live page):
+        <div class="panel">
+          <div class="flex grid-md">
+            <div class="flex-fill flex-min grid-cell content-formatting">
+              <a class="panel-heading" href="...">
+                <i class="fas fa-arrow-up"></i>
+                <h3>Church Name <br></h3>
+              </a>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="church-info">
+              <h4>Pastor Name</h4>
+              <p class="address"><i ...></i> Street City, ST ZIP</p>
+              <p class="phone"><i ...></i> (555) 555-5555</p>
+            </div>
+          </div>
+        </div>
+    """
+    c = Church()
+
+    # Church name lives in the sibling .panel-heading, one level up from .church-info
+    panel = info_div.find_parent("div", class_="panel")
+    if panel:
+        h3 = panel.select_one(".panel-heading h3")
+        c.church_name = _text(h3)
+
+    # Pastor — <h4> directly inside .church-info
+    c.pastor = _text(info_div.find("h4"))
+
+    # Address — <p class="address">; the <i> icon carries no text
+    addr_p = info_div.select_one("p.address")
+    raw_addr = _text(addr_p)
+    c.address, c.state, c.zip_code = parse_address(raw_addr)
+
+    # Phone — <p class="phone">
+    phone_p = info_div.select_one("p.phone")
+    c.phone = _text(phone_p)
+
+    return c if c.is_valid() else None
+
+
+def parse_page(driver: uc.Chrome) -> list[Church]:
+    """Extract all churches from the currently loaded page."""
+    soup = BeautifulSoup(driver.page_source, "lxml")
+    info_divs = soup.select(CARD_SELECTOR)
+    churches: list[Church] = []
+    for div in info_divs:
+        church = parse_card(div)
         if church:
             churches.append(church)
-
-    log.info(f"  → {len(churches)} iglesias encontradas en esta página")
+    log.info("  -> %d churches on this page", len(churches))
     return churches
 
 
-# ─── Navegación y paginación ──────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Navigation
+# ---------------------------------------------------------------------------
 
-def wait_for_results(driver: webdriver.Chrome, timeout: int = 15):
-    """Espera a que los resultados carguen."""
+def wait_for_results(driver: uc.Chrome) -> None:
+    """
+    Block until church-info cards are present on the page.
+
+    The site sits behind Cloudflare, which shows a 'Just a moment...' challenge
+    page before rendering real content. We wait for the challenge to clear first,
+    then wait for the actual church cards.
+    """
     try:
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR,
-                 ".church-result, .directory-result, .search-result, "
-                 "[class*='result'], li.result, article")
-            )
+        # Step 1: wait for Cloudflare challenge to clear
+        WebDriverWait(driver, RESULTS_TIMEOUT).until(
+            lambda d: "just a moment" not in d.title.lower()
         )
-        time.sleep(1.5)  # margen extra para JS
     except TimeoutException:
-        log.warning("Timeout esperando resultados — puede que no haya resultados.")
+        log.warning("Cloudflare challenge did not clear within %ds.", RESULTS_TIMEOUT)
+        return
 
-
-def apply_filters(driver: webdriver.Chrome, state: str = "", zip_code: str = ""):
-    """Aplica filtros de estado y/o código postal si están disponibles."""
-    wait = WebDriverWait(driver, 10)
-
-    if state:
-        try:
-            state_select = wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "select[name*='state'], select#state, select[id*='state']")
-                )
-            )
-            Select(state_select).select_by_value(state.upper())
-            log.info(f"Filtro de estado aplicado: {state}")
-            time.sleep(1)
-        except (TimeoutException, NoSuchElementException):
-            log.warning("No se encontró selector de estado.")
-
-    if zip_code:
-        try:
-            zip_input = wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR,
-                     "input[name*='zip'], input[id*='zip'], input[placeholder*='zip' i]")
-                )
-            )
-            zip_input.clear()
-            zip_input.send_keys(zip_code)
-            log.info(f"Filtro de código postal aplicado: {zip_code}")
-            time.sleep(0.5)
-        except (TimeoutException, NoSuchElementException):
-            log.warning("No se encontró campo de código postal.")
-
-    # Buscar botón de búsqueda y hacer click
     try:
-        search_btn = driver.find_element(
-            By.CSS_SELECTOR,
-            "button[type='submit'], input[type='submit'], .search-btn, [class*='search-button']"
+        # Step 2: wait for church cards to appear
+        WebDriverWait(driver, RESULTS_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, CARD_SELECTOR))
         )
-        search_btn.click()
-        log.info("Búsqueda enviada.")
-    except NoSuchElementException:
-        log.warning("No se encontró botón de búsqueda.")
+        time.sleep(0.5)
+    except TimeoutException:
+        log.warning("Timed out waiting for church cards — page may be empty.")
 
 
-def go_to_next_page(driver: webdriver.Chrome) -> bool:
+def get_page_urls(driver: uc.Chrome) -> list[str]:
     """
-    Hace click en 'Siguiente página'. Devuelve True si hubo página siguiente,
-    False si era la última.
+    Extract all page URLs from the pagination nav on the current page.
+
+    The site renders pagination as:
+        <ul class="pagination">
+          <li><a href="...?page=1">1</a></li>
+          ...
+        </ul>
+
+    Returns a list of URLs sorted by page number.
     """
-    try:
-        next_btn = driver.find_element(
-            By.CSS_SELECTOR,
-            "a[rel='next'], .next-page, [aria-label='Next'], "
-            "[class*='next']:not([class*='disabled']), li.next a"
-        )
-        if next_btn and next_btn.is_displayed() and next_btn.is_enabled():
-            driver.execute_script("arguments[0].click();", next_btn)
-            time.sleep(2)
-            wait_for_results(driver)
-            return True
-    except NoSuchElementException:
-        pass
-    return False
+    soup = BeautifulSoup(driver.page_source, "lxml")
+    page_re = re.compile(r"[?&]page=(\d+)")
+    seen: dict[int, str] = {}
+
+    for a in soup.select("ul.pagination li a"):
+        href = a.get("href", "")
+        m = page_re.search(href)
+        if m:
+            seen[int(m.group(1))] = href
+
+    return [seen[n] for n in sorted(seen)]
 
 
-# ─── Flujo principal ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main scraping loop
+# ---------------------------------------------------------------------------
 
-def scrape(
-    state: str = "",
-    zip_code: str = "",
-    headless: bool = True,
-    max_pages: int = 500,
-    output_dir: str = ".",
-) -> list[Church]:
+def scrape(url: str, headless: bool, max_pages: int, dump_html: bool) -> list[Church]:
     driver = build_driver(headless=headless)
     all_churches: list[Church] = []
 
     try:
-        log.info(f"Abriendo {BASE_URL}")
-        driver.get(BASE_URL)
-        time.sleep(3)
-
-        # Aplicar filtros si se indicaron
-        if state or zip_code:
-            apply_filters(driver, state=state, zip_code=zip_code)
-            time.sleep(2)
-
+        log.info("Loading: %s", url)
+        driver.get(url)
+        time.sleep(PAGE_LOAD_WAIT)
         wait_for_results(driver)
 
-        page = 1
-        while page <= max_pages:
-            log.info(f"── Página {page} ──")
-            churches = parse_results_page(driver)
+        if dump_html:
+            html_path = Path("page.html")
+            html_path.write_text(driver.page_source, encoding="utf-8")
+            log.info("Page HTML saved to %s", html_path)
+
+        # Collect all page URLs from the pagination on the first page
+        page_urls = get_page_urls(driver)
+        if page_urls:
+            log.info("Found %d pages via pagination", len(page_urls))
+        else:
+            # Single page — no pagination present
+            log.info("No pagination found; scraping single page")
+            page_urls = [driver.current_url]
+
+        page_urls = page_urls[:max_pages]
+
+        for page_num, page_url in enumerate(page_urls, start=1):
+            log.info("── Page %d / %d ──", page_num, len(page_urls))
+
+            # Page 1 is already loaded; navigate for subsequent pages
+            if page_num > 1:
+                driver.get(page_url)
+                time.sleep(PAGE_LOAD_WAIT)
+                wait_for_results(driver)
+                log.debug("Current URL after navigation: %s", driver.current_url)
+                log.debug("Page title: %s", driver.title)
+
+            churches = parse_page(driver)
             all_churches.extend(churches)
 
-            if not go_to_next_page(driver):
-                log.info("Última página alcanzada.")
-                break
-            page += 1
-
-    except Exception as exc:
-        log.error(f"Error durante el scraping: {exc}", exc_info=True)
+    except Exception:
+        log.exception("Fatal error during scraping")
     finally:
         driver.quit()
 
+    log.info("Total churches collected: %d", len(all_churches))
     return all_churches
 
 
-# ─── Exportación ──────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
 
-def export(churches: list[Church], output_dir: str = "."):
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+def export_csv(churches: list[Church], output_path: str) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     if not churches:
-        log.warning("Sin datos que exportar.")
+        log.warning("No data to export.")
         return
 
-    # CSV
-    csv_path = out / "ag_churches.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=Church.__dataclass_fields__.keys())
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
-        for c in churches:
-            row = asdict(c)
-            row.pop("extra", None)          # omitir dict anidado
-            writer.writerow(row)
-    log.info(f"CSV guardado: {csv_path}")
+        writer.writerows(asdict(c) for c in churches)
 
-    # JSON
-    json_path = out / "ag_churches.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump([asdict(c) for c in churches], f, ensure_ascii=False, indent=2)
-    log.info(f"JSON guardado: {json_path}")
-
-    # Excel
-    try:
-        records = [asdict(c) for c in churches]
-        for r in records:
-            r.pop("extra", None)
-        df = pd.DataFrame(records)
-        xlsx_path = out / "ag_churches.xlsx"
-        df.to_excel(xlsx_path, index=False, sheet_name="Iglesias AG")
-        log.info(f"Excel guardado: {xlsx_path}")
-    except Exception as e:
-        log.warning(f"No se pudo guardar Excel: {e}")
-
-    log.info(f"\n✅ Total de iglesias descargadas: {len(churches)}")
+    log.info("CSV saved: %s (%d rows)", path, len(churches))
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scraper del directorio de iglesias Assemblies of God (ag.org)"
+        description="Scrape the AG.org Church Directory and export to CSV.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--state",     default="", help="Código de estado (ej: TX, CA, FL)")
-    parser.add_argument("--zip",       default="", help="Código postal")
-    parser.add_argument("--headless",  default="True", help="True/False — mostrar navegador")
-    parser.add_argument("--max-pages", type=int, default=500, help="Máximo de páginas a raspar")
-    parser.add_argument("--output",    default=".", help="Directorio de salida")
-    args = parser.parse_args()
+    parser.add_argument("--url", default=DEFAULT_URL, help="Directory URL to scrape")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV file path")
+    parser.add_argument(
+        "--headless",
+        default="true",
+        choices=["true", "false"],
+        help="Run Chrome in headless mode",
+    )
+    parser.add_argument(
+        "--max-pages", type=int, default=200, help="Maximum pages to paginate through"
+    )
+    parser.add_argument(
+        "--dump-html",
+        action="store_true",
+        help="Save the first page HTML to page.html for selector debugging",
+    )
+    return parser.parse_args()
 
-    headless = args.headless.lower() not in ("false", "0", "no")
+
+def main() -> None:
+    args = parse_args()
+    headless = args.headless.lower() == "true"
 
     log.info("=" * 60)
-    log.info("Scraper de Iglesias AG — ag.org")
+    log.info("AG.org Church Directory Scraper")
+    log.info("URL      : %s", args.url)
+    log.info("Output   : %s", args.output)
+    log.info("Headless : %s", headless)
     log.info("=" * 60)
 
     churches = scrape(
-        state=args.state,
-        zip_code=args.zip,
+        url=args.url,
         headless=headless,
         max_pages=args.max_pages,
-        output_dir=args.output,
+        dump_html=args.dump_html,
     )
-
-    export(churches, output_dir=args.output)
+    export_csv(churches, args.output)
 
 
 if __name__ == "__main__":

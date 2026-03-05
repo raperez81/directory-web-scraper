@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Scraper output
+*.csv
+*.json
+*.xlsx
+*.log
+page.html
+
+# Exception
+!churches_by_state/
+!churches_by_state/*.csv
+!churches_by_state/*.json
+!churches_by_state/*.xlsx
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp

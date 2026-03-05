@@ -1,0 +1,12 @@
+[project]
+name = "ag-church-scraper"
+version = "0.1.0"
+description = "Scrape the AG.org Church Directory and export results to CSV"
+requires-python = ">=3.11"
+dependencies = [
+    "selenium>=4.20",
+    "webdriver-manager>=4.0",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "undetected-chromedriver>=3.5.5",
+]
